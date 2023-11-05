@@ -23,13 +23,6 @@ import torch.nn.functional as F
 
 import time
 
-urls = {
-    'raft-stereo-fast-cuda-128x160.scripted.pt': 'https://github.com/nburrus/stereodemo/releases/download/v0.1-raft-stereo/raft-stereo-fast-cuda-128x160.scripted.pt',
-    'raft-stereo-fast-cuda-256x320.scripted.pt': 'https://github.com/nburrus/stereodemo/releases/download/v0.1-raft-stereo/raft-stereo-fast-cuda-256x320.scripted.pt',
-    'raft-stereo-fast-cuda-480x640.scripted.pt': 'https://github.com/nburrus/stereodemo/releases/download/v0.1-raft-stereo/raft-stereo-fast-cuda-480x640.scripted.pt',
-    'raft-stereo-fast-cuda-736x1280.scripted.pt': 'https://github.com/nburrus/stereodemo/releases/download/v0.1-raft-stereo/raft-stereo-fast-cuda-736x1280.scripted.pt',
-}
-
 
 class DepthStereoNetwork(Node):
     """A ROS2 node for running a deep stereo network."""
@@ -51,7 +44,7 @@ class DepthStereoNetwork(Node):
         )
 
         if not model_path.exists():
-            self._download_model(urls[model_path.name], model_path)
+            self._download_model(model_path)
         assert model_path.exists()
 
         self.net = torch.jit.load(model_path)
@@ -117,7 +110,14 @@ class DepthStereoNetwork(Node):
         )
         assert self._device in ['cpu', 'cuda']
 
-    def _download_model(self, url: str, model_path: Path):
+    def _download_model(model_path: Path):
+        urls = {
+            'raft-stereo-fast-cuda-128x160.scripted.pt': 'https://github.com/nburrus/stereodemo/releases/download/v0.1-raft-stereo/raft-stereo-fast-cuda-128x160.scripted.pt',
+            'raft-stereo-fast-cuda-256x320.scripted.pt': 'https://github.com/nburrus/stereodemo/releases/download/v0.1-raft-stereo/raft-stereo-fast-cuda-256x320.scripted.pt',
+            'raft-stereo-fast-cuda-480x640.scripted.pt': 'https://github.com/nburrus/stereodemo/releases/download/v0.1-raft-stereo/raft-stereo-fast-cuda-480x640.scripted.pt',
+            'raft-stereo-fast-cuda-736x1280.scripted.pt': 'https://github.com/nburrus/stereodemo/releases/download/v0.1-raft-stereo/raft-stereo-fast-cuda-736x1280.scripted.pt',
+        }
+        url = urls[model_path.name]
         filename = model_path.name
         with tempfile.TemporaryDirectory() as d:
             tmp_file_path = Path(d) / filename
@@ -151,25 +151,22 @@ class DepthStereoNetwork(Node):
         focal_length = msg_cam_info_l.k[0]
         baseline = -msg_cam_info_l.p[3]/focal_length
 
-        if self.pub_disp.get_subscription_count() > 0:
-            self.pub_disp.publish(self._create_disparity_msg(
-                disparity, msg_img_l.header, focal_length=focal_length,
-                baseline=baseline))
+        self.pub_disp.publish(self._create_disparity_msg(
+            disparity, msg_img_l.header, focal_length=focal_length,
+            baseline=baseline))
 
         # https://github.com/princeton-vl/RAFT-Stereo#converting-disparity-to-depth
         cxl = msg_cam_info_l.k[2]
         cxr = msg_cam_info_r.k[2]
         depth = baseline*focal_length/np.abs(disparity + cxl - cxr)
 
-        if self.pub_depth.get_subscription_count() > 0:
-            self.pub_depth.publish(self._bridge.cv2_to_imgmsg(
-                depth, header=msg_img_l.header))
+        self.pub_depth.publish(self._bridge.cv2_to_imgmsg(
+            depth, header=msg_img_l.header))
 
-        if self.pub_pcl.get_subscription_count() > 0:
-            xyzi = self._reconstruct(
-                depth, np.array(msg_cam_info_l.k).reshape(3, 3), img_l)
-            self.pub_pcl.publish(self._create_pcl_msg(
-                xyzi, msg_img_l.header, 'xyzi'))
+        xyzi = self._reconstruct(
+            depth, np.array(msg_cam_info_l.k).reshape(3, 3), img_l)
+        self.pub_pcl.publish(self._create_pcl_msg(
+            xyzi, msg_img_l.header, 'xyzi'))
 
         self.get_logger().info(
             f'[{msg_img_l.header.stamp.sec}.{msg_img_l.header.stamp.nanosec}] Total: {time.time() - t0}s, Inference: {t2 - t1}s')
@@ -198,6 +195,18 @@ class DepthStereoNetwork(Node):
         disparity[:, -40:] = np.nan
         disparity[-20:] = np.nan
 
+    def _reconstruct(self, Z, K, I):
+        # xyz = z * K^-1 * uv1
+        uv = np.dstack(np.meshgrid(
+            np.arange(Z.shape[1]), np.arange(Z.shape[0]))).reshape(-1, 2)
+        uv1 = np.ones((uv.shape[0], 3))
+        uv1[:, :2] = uv
+        xyz = (Z.reshape((-1, 1)) * (np.linalg.inv(K) @
+               uv1.T).T).reshape(Z.shape[0], Z.shape[1], 3)
+        intensity = I[uv[:, 1], uv[:, 0]].reshape(Z.shape[0], Z.shape[1], 1)
+        xyz[xyz[:, :, 2] <= 0] = np.nan
+        return np.dstack([xyz, intensity])
+
     def _create_disparity_msg(self, disparity, header, focal_length, baseline):
         msg_disp_l = DisparityImage()
         msg_disp_l.header = header
@@ -209,17 +218,6 @@ class DepthStereoNetwork(Node):
         msg_disp_l.min_disparity = focal_length * baseline/self._max_depth
         msg_disp_l.max_disparity = focal_length * baseline/self._min_depth
         msg_disp_l.delta_d = self._delta_d
-
-    def _reconstruct(self, Z, K, I):
-        uv = np.dstack(np.meshgrid(
-            np.arange(Z.shape[1]), np.arange(Z.shape[0]))).reshape(-1, 2)
-        uv1 = np.ones((uv.shape[0], 3))
-        uv1[:, :2] = uv
-        xyz = (Z.reshape((-1, 1)) * (np.linalg.inv(K) @
-               uv1.T).T).reshape(Z.shape[0], Z.shape[1], 3)
-        intensity = I[uv[:, 1], uv[:, 0]].reshape(Z.shape[0], Z.shape[1], 1)
-        xyz[xyz[:, :, 2] <= 0] = np.nan
-        return np.dstack([xyz, intensity])
 
     def _create_pcl_msg(self, points, header, fields='xyz'):
         ros_dtype = sensor_msgs.msg.PointField.FLOAT32
